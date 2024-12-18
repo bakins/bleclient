@@ -8,14 +8,13 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"golang.org/x/sync/errgroup"
 )
 
 // Address contains a Bluetooth MAC address.
 type Address struct {
 	MACAddress
 }
-
-// Advertisement encapsulates a single advertisement instance.
 
 func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult)) error {
 	if a.scanCancelChan != nil {
@@ -254,27 +253,37 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 			return Device{}, fmt.Errorf("bluetooth: failed to connect: %w", err)
 		}
 
-		// Wait until the device has connected.
-		connectChan := make(chan struct{})
-		go func() {
-			for sig := range signal {
-				switch sig.Name {
-				case "org.freedesktop.DBus.Properties.PropertiesChanged":
-					interfaceName := sig.Body[0].(string)
-					if interfaceName != "org.bluez.Device1" {
-						continue
+		eg, ctx := errgroup.WithContext(ctx)
+		eg.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case sig, ok := <-signal:
+					if !ok {
+						return errors.New("did not receive connected signal")
 					}
-					if sig.Path != device.device.Path() {
-						continue
-					}
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-						close(connectChan)
+					switch sig.Name {
+					case "org.freedesktop.DBus.Properties.PropertiesChanged":
+						interfaceName := sig.Body[0].(string)
+						if interfaceName != "org.bluez.Device1" {
+							continue
+						}
+						if sig.Path != device.device.Path() {
+							continue
+						}
+						changes := sig.Body[1].(map[string]dbus.Variant)
+						if connected, ok := changes["Connected"].Value().(bool); ok && connected {
+							return nil
+						}
 					}
 				}
 			}
-		}()
-		<-connectChan
+		})
+
+		if err := eg.Wait(); err != nil {
+			return Device{}, err
+		}
 	}
 
 	return device, nil
@@ -283,8 +292,7 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
 func (d Device) Disconnect() error {
-	// we don't call our cancel function here, instead we wait for the
-	// property change in `watchForConnect` and cancel things then
+	// how to wait until is disconnected?
 	return d.device.Call("org.bluez.Device1.Disconnect", 0).Err
 }
 
