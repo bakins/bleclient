@@ -28,7 +28,13 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	a.scanCancelChan = cancelChan
 
 	// This appears to be necessary to receive any BLE discovery results at all.
-	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+
+		a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.SetDiscoveryFilter", 0)
+	}()
+
 	err := a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
 		"Transport": "le",
 	}).Err
@@ -92,18 +98,25 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		return err
 	}
 
+	stop := func(ctx context.Context) error {
+		ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+		defer cancel()
+
+		return a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StopDiscovery", 0).Err
+	}
+
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
 		// condition between the signal channel and the cancelScan channel when
 		// the callback calls StopScan() (no new callbacks may be called after
 		// StopScan is called).
 		select {
-		case <-cancelChan:
-			return a.adapter.Call("org.bluez.Adapter1.StopDiscovery", 0).Err
-		default:
-		}
+		case <-ctx.Done():
+			return stop(ctx)
 
-		select {
+		case <-cancelChan:
+			return stop(ctx)
+
 		case sig := <-signal:
 			// This channel receives anything that we watch for, so we'll have
 			// to check for signals that are relevant to us.
@@ -134,8 +147,6 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				}
 				callback(a, makeScanResult(device))
 			}
-		case <-cancelChan:
-			continue
 		}
 	}
 }
@@ -293,7 +304,10 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 // wait until the connection is fully gone.
 func (d Device) Disconnect() error {
 	// how to wait until is disconnected?
-	return d.device.Call("org.bluez.Device1.Disconnect", 0).Err
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
+	return d.device.CallWithContext(ctx, "org.bluez.Device1.Disconnect", 0).Err
 }
 
 var (

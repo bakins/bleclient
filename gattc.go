@@ -1,6 +1,7 @@
 package bleclient
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"strings"
@@ -37,10 +38,11 @@ func (s DeviceService) UUID() UUID {
 //
 // On Linux with BlueZ, this just waits for the ServicesResolved signal (if
 // services haven't been resolved yet) and uses this list of cached services.
-func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
+func (d Device) DiscoverServices(ctx context.Context, uuids []UUID) ([]*DeviceService, error) {
 	start := time.Now()
 
 	for {
+		// TODO: check context
 		resolved, err := d.device.GetProperty("org.bluez.Device1.ServicesResolved")
 		if err != nil {
 			return nil, err
@@ -57,14 +59,14 @@ func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
 		}
 	}
 
-	services := []DeviceService{}
+	services := []*DeviceService{}
 	uuidServices := make(map[UUID]struct{})
 	servicesFound := 0
 
 	// Iterate through all objects managed by BlueZ, hoping to find the services
 	// we're looking for.
 	var list map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	err := d.adapter.bluez.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&list)
+	err := d.adapter.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&list)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +112,7 @@ func (d Device) DiscoverServices(uuids []UUID) ([]DeviceService, error) {
 			servicePath: objectPath,
 		}
 
-		services = append(services, ds)
+		services = append(services, &ds)
 		servicesFound++
 		uuidServices[serviceUUID] = struct{}{}
 	}
@@ -146,7 +148,7 @@ func (c DeviceCharacteristic) UUID() UUID {
 //
 // Passing a nil slice of UUIDs will return a complete
 // list of characteristics.
-func (s DeviceService) DiscoverCharacteristics(uuids []UUID) ([]DeviceCharacteristic, error) {
+func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUID) ([]DeviceCharacteristic, error) {
 	var chars []DeviceCharacteristic
 	if len(uuids) > 0 {
 		// The caller wants to get a list of characteristics in a specific
@@ -157,7 +159,7 @@ func (s DeviceService) DiscoverCharacteristics(uuids []UUID) ([]DeviceCharacteri
 	// Iterate through all objects managed by BlueZ, hoping to find the
 	// characteristic we're looking for.
 	var list map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	err := s.adapter.bluez.Call("org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&list)
+	err := s.adapter.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&list)
 	if err != nil {
 		return nil, err
 	}
@@ -217,8 +219,8 @@ func (s DeviceService) DiscoverCharacteristics(uuids []UUID) ([]DeviceCharacteri
 // call will return before all data has been written. A limited number of such
 // writes can be in flight at any given time. This call is also known as a
 // "write command" (as opposed to a write request).
-func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) {
-	err = c.characteristic.Call("org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
+func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byte) (n int, err error) {
+	err = c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
 	if err != nil {
 		return 0, err
 	}
@@ -231,7 +233,7 @@ func (c DeviceCharacteristic) WriteWithoutResponse(p []byte) (n int, err error) 
 // changes.
 //
 // Users may call EnableNotifications with a nil callback to disable notifications.
-func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) error {
+func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback func(buf []byte)) error {
 	switch callback {
 	default:
 		if c.property != nil {
@@ -247,7 +249,7 @@ func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) err
 			return err
 		}
 
-		err := c.characteristic.Call("org.bluez.GattCharacteristic1.StartNotify", 0).Err
+		err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
 		if err != nil {
 			return err
 		}
@@ -285,7 +287,7 @@ func (c DeviceCharacteristic) EnableNotifications(callback func(buf []byte)) err
 }
 
 // GetMTU returns the MTU for the characteristic.
-func (c DeviceCharacteristic) GetMTU() (uint16, error) {
+func (c *DeviceCharacteristic) GetMTU() (uint16, error) {
 	mtu, err := c.characteristic.GetProperty("org.bluez.GattCharacteristic1.MTU")
 	if err != nil {
 		return uint16(0), err
@@ -294,7 +296,7 @@ func (c DeviceCharacteristic) GetMTU() (uint16, error) {
 }
 
 // Read reads the current characteristic value.
-func (c DeviceCharacteristic) Read(data []byte) (int, error) {
+func (c *DeviceCharacteristic) Read(data []byte) (int, error) {
 	options := make(map[string]interface{})
 	var result []byte
 	err := c.characteristic.Call("org.bluez.GattCharacteristic1.ReadValue", 0, options).Store(&result)
