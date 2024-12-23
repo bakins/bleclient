@@ -39,7 +39,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		"Transport": "le",
 	}).Err
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to set bluetooth discovery filters %w", err)
 	}
 
 	signal := make(chan *dbus.Signal)
@@ -47,7 +47,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	defer a.bus.RemoveSignal(signal)
 
 	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
-	if err := a.bus.AddMatchSignal(propertiesChangedMatchOptions...); err != nil {
+	if err := a.bus.AddMatchSignalContext(ctx, propertiesChangedMatchOptions...); err != nil {
 		return err
 	}
 	defer func() {
@@ -55,21 +55,15 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	}()
 
 	newObjectMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager")}
-	if err := a.bus.AddMatchSignal(newObjectMatchOptions...); err != nil {
+	if err := a.bus.AddMatchSignalContext(ctx, newObjectMatchOptions...); err != nil {
 		return err
 	}
 	defer func() {
 		_ = a.bus.RemoveMatchSignal(newObjectMatchOptions...)
 	}()
 
-	// Go through all connected devices and present the connected devices as
-	// scan results. Also save the properties so that the full list of
-	// properties is known on a PropertiesChanged signal. We can't present the
-	// list of cached devices as scan results as devices may be cached for a
-	// long time, long after they have moved out of range.
 	var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	err = a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList)
-	if err != nil {
+	if err := a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
 		return err
 	}
 	devices := make(map[dbus.ObjectPath]map[string]dbus.Variant)
@@ -81,29 +75,32 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		if !strings.HasPrefix(string(path), string(a.adapter.Path())) {
 			continue // not part of our adapter
 		}
-		if device["Connected"].Value().(bool) {
-			callback(a, makeScanResult(device))
-			select {
-			case <-cancelChan:
-				return nil
-			default:
-			}
+
+		// try all devices, some may be out of range. could check RSSI?
+		// if not, then only a single client may resolve
+		callback(a, makeScanResult(device))
+		select {
+		case <-cancelChan:
+			return nil
+		default:
 		}
+
 		devices[path] = device
 	}
 
 	// Instruct BlueZ to start discovering.
-	err = a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StartDiscovery", 0).Err
-	if err != nil {
-		return err
+	if err := a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StartDiscovery", 0).Err; err != nil {
+		return fmt.Errorf("failed to start bluetooth discovery %w", err)
 	}
 
-	stop := func(ctx context.Context) error {
-		ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	stop := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 		defer cancel()
 
 		return a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StopDiscovery", 0).Err
 	}
+
+	defer stop()
 
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
@@ -112,12 +109,13 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		// StopScan is called).
 		select {
 		case <-ctx.Done():
-			return stop(ctx)
+			return ctx.Err()
 
 		case <-cancelChan:
-			return stop(ctx)
+			return nil
 
 		case sig := <-signal:
+			fmt.Println(sig.Name)
 			// This channel receives anything that we watch for, so we'll have
 			// to check for signals that are relevant to us.
 			switch sig.Name {
@@ -132,6 +130,9 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				callback(a, makeScanResult(rawprops))
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
+
+				fmt.Println(interfaceName)
+
 				if interfaceName != "org.bluez.Device1" {
 					continue
 				}
@@ -229,7 +230,7 @@ type Device struct {
 }
 
 // Connect starts a connection attempt to the given peripheral device address.
-func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) {
+func (a *Adapter) Connect(ctx context.Context, address Address) (*Device, error) {
 	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.Replace(address.MAC.String(), ":", "_", -1))
 	device := Device{
 		Address: address,
@@ -244,8 +245,8 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 	a.bus.Signal(signal)
 	defer a.bus.RemoveSignal(signal)
 	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
-	if err := a.bus.AddMatchSignal(propertiesChangedMatchOptions...); err != nil {
-		return Device{}, err
+	if err := a.bus.AddMatchSignalContext(ctx, propertiesChangedMatchOptions...); err != nil {
+		return nil, err
 	}
 	defer func() {
 		_ = a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
@@ -254,14 +255,14 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 	// Read whether this device is already connected.
 	connected, err := device.device.GetProperty("org.bluez.Device1.Connected")
 	if err != nil {
-		return Device{}, err
+		return nil, err
 	}
 
 	// Connect to the device, if not already connected.
 	if !connected.Value().(bool) {
 		err := device.device.CallWithContext(ctx, "org.bluez.Device1.Connect", 0).Err
 		if err != nil {
-			return Device{}, fmt.Errorf("bluetooth: failed to connect: %w", err)
+			return nil, fmt.Errorf("bluetooth: failed to connect: %w", err)
 		}
 
 		eg, ctx := errgroup.WithContext(ctx)
@@ -293,16 +294,16 @@ func (a *Adapter) Connect(ctx context.Context, address Address) (Device, error) 
 		})
 
 		if err := eg.Wait(); err != nil {
-			return Device{}, err
+			return nil, err
 		}
 	}
 
-	return device, nil
+	return &device, nil
 }
 
 // Disconnect from the BLE device. This method is non-blocking and does not
 // wait until the connection is fully gone.
-func (d Device) Disconnect() error {
+func (d *Device) Disconnect() error {
 	// how to wait until is disconnected?
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
