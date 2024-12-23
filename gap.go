@@ -77,7 +77,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		}
 
 		// try all devices, some may be out of range. could check RSSI?
-		// if not, then only a single client may resolve
+		// if not, then only a single client may resolve devices.
 		callback(a, makeScanResult(device))
 		select {
 		case <-cancelChan:
@@ -115,7 +115,6 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 			return nil
 
 		case sig := <-signal:
-			fmt.Println(sig.Name)
 			// This channel receives anything that we watch for, so we'll have
 			// to check for signals that are relevant to us.
 			switch sig.Name {
@@ -130,8 +129,6 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				callback(a, makeScanResult(rawprops))
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
-
-				fmt.Println(interfaceName)
 
 				if interfaceName != "org.bluez.Device1" {
 					continue
