@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -14,6 +15,60 @@ import (
 // Address contains a Bluetooth MAC address.
 type Address struct {
 	MACAddress
+}
+
+type deviceCache struct {
+	mu      sync.Mutex
+	devices map[dbus.ObjectPath]map[string]dbus.Variant
+	adapter *Adapter
+}
+
+func (d *deviceCache) load(path dbus.ObjectPath, properties map[string]dbus.Variant) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fmt.Println("loading", path)
+
+	d.devices[path] = properties
+}
+
+func (d *deviceCache) Upsert(ctx context.Context, path dbus.ObjectPath, properties map[string]dbus.Variant) (map[string]dbus.Variant, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fmt.Println("upsert", path)
+
+	if _, ok := d.devices[path]; !ok {
+		fmt.Println("refreshing cache", path)
+
+		var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+		if err := d.adapter.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
+			return nil, err
+		}
+
+		for path, v := range deviceList {
+			device, ok := v["org.bluez.Device1"]
+			if !ok {
+				continue // not a device
+			}
+			if !strings.HasPrefix(string(path), string(d.adapter.adapter.Path())) {
+				continue // not part of our adapter
+			}
+
+			d.devices[path] = device
+		}
+	}
+
+	device, ok := d.devices[path]
+	if !ok {
+		return nil, fmt.Errorf("did not find device %s", path)
+	}
+
+	for k, v := range properties {
+		device[k] = v
+	}
+
+	return device, nil
 }
 
 func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult)) error {
@@ -48,6 +103,29 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	// then we miss some devices.
 	// This is a hack that we can probably remove with some thought.
 	signal := make(chan *dbus.Signal, 1024)
+
+	callbackChan := make(chan ScanResult, 1024)
+	defer close(callbackChan)
+
+	eg, ctx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case result, ok := <-callbackChan:
+				if ok {
+					callback(a, result)
+				}
+			}
+		}
+	})
+
+	manager := &deviceCache{
+		devices: map[dbus.ObjectPath]map[string]dbus.Variant{},
+		adapter: a,
+	}
+
 	a.bus.Signal(signal)
 	defer a.bus.RemoveSignal(signal)
 
@@ -72,7 +150,6 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		return err
 	}
 
-	devices := make(map[dbus.ObjectPath]map[string]dbus.Variant)
 	for path, v := range deviceList {
 		device, ok := v["org.bluez.Device1"]
 		if !ok {
@@ -82,19 +159,8 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 			continue // not part of our adapter
 		}
 
-		// localName, _ := device["Name"].Value().(string)
-		// fmt.Println("managed device", device["Address"].Value().(string), localName)
-
-		// try all devices, some may be out of range. could check RSSI?
-		// if not, then only a single client may resolve devices.
-		callback(a, makeScanResult(device))
-		select {
-		case <-cancelChan:
-			return nil
-		default:
-		}
-
-		devices[path] = device
+		manager.load(path, device)
+		callbackChan <- makeScanResult(device)
 	}
 
 	// Instruct BlueZ to start discovering.
@@ -116,73 +182,66 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		stop()
 	}()
 
-	for {
-		// Check whether the scan is stopped. This is necessary to avoid a race
-		// condition between the signal channel and the cancelScan channel when
-		// the callback calls StopScan() (no new callbacks may be called after
-		// StopScan is called).
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
+	eg.Go(func() error {
+		for {
+			// Check whether the scan is stopped. This is necessary to avoid a race
+			// condition between the signal channel and the cancelScan channel when
+			// the callback calls StopScan() (no new callbacks may be called after
+			// StopScan is called).
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
 
-		case <-cancelChan:
-			return nil
+			case <-cancelChan:
+				return nil
 
-		case sig := <-signal:
-			// This channel receives anything that we watch for, so we'll have
-			// to check for signals that are relevant to us.
-			switch sig.Name {
-			case "org.freedesktop.DBus.ObjectManager.InterfacesAdded":
-				objectPath := sig.Body[0].(dbus.ObjectPath)
-				interfaces := sig.Body[1].(map[string]map[string]dbus.Variant)
+			case sig := <-signal:
+				// This channel receives anything that we watch for, so we'll have
+				// to check for signals that are relevant to us.
+				switch sig.Name {
+				case "org.freedesktop.DBus.ObjectManager.InterfacesAdded":
+					objectPath := sig.Body[0].(dbus.ObjectPath)
+					interfaces := sig.Body[1].(map[string]map[string]dbus.Variant)
 
-				rawprops, ok := interfaces["org.bluez.Device1"]
-				if !ok {
-					continue
-				}
-
-				devices[objectPath] = rawprops
-
-				// localName, _ := rawprops["Name"].Value().(string)
-				// fmt.Println("InterfacesAdded", rawprops["Address"].Value().(string), localName)
-
-				callback(a, makeScanResult(rawprops))
-			case "org.freedesktop.DBus.Properties.PropertiesChanged":
-				interfaceName := sig.Body[0].(string)
-
-				if interfaceName != "org.bluez.Device1" {
-					continue
-				}
-				changes := sig.Body[1].(map[string]dbus.Variant)
-				device, ok := devices[sig.Path]
-				if !ok {
-					// This shouldn't happen, but protect against it just in
-					// case.
-					// Could we try to get the device
-					continue
-				}
-
-				// do not report only rssi changes
-				if len(changes) == 1 {
-					if _, ok := changes["RSSI"]; ok {
+					rawprops, ok := interfaces["org.bluez.Device1"]
+					if !ok {
 						continue
 					}
+
+					manager.load(objectPath, rawprops)
+
+					callbackChan <- makeScanResult(rawprops)
+
+				case "org.freedesktop.DBus.Properties.PropertiesChanged":
+					interfaceName := sig.Body[0].(string)
+
+					if interfaceName != "org.bluez.Device1" {
+						continue
+					}
+					changes := sig.Body[1].(map[string]dbus.Variant)
+
+					// do not report only rssi changes
+					if len(changes) == 1 {
+						if _, ok := changes["RSSI"]; ok {
+							continue
+						}
+					}
+
+					device, _ := manager.Upsert(ctx, sig.Path, changes)
+					if device != nil {
+						callbackChan <- makeScanResult(device)
+					}
 				}
-
-				// var keys []string
-
-				for k, v := range changes {
-					device[k] = v
-					// keys = append(keys, k)
-				}
-
-				// localName, _ := device["Name"].Value().(string)
-				// fmt.Println("PropertiesChanged", device["Address"].Value().(string), localName, keys)
-
-				callback(a, makeScanResult(device))
 			}
 		}
+	})
+
+	err = eg.Wait()
+	if err == context.Canceled {
+		err = nil
 	}
+
+	return err
 }
 
 // StopScan stops any in-progress scan. It can be called from within a Scan
