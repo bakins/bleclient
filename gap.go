@@ -36,13 +36,18 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	}()
 
 	err := a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
-		"Transport": "le",
+		"Transport":     "le",
+		"DuplicateData": true,
 	}).Err
 	if err != nil {
 		return fmt.Errorf("failed to set bluetooth discovery filters %w", err)
 	}
 
-	signal := make(chan *dbus.Signal)
+	// there's a small race when signals may be dropped by us
+	// as we do more setup, so use a buffered channel. If we don't
+	// then we miss some devices.
+	// This is a hack that we can probably remove with some thought.
+	signal := make(chan *dbus.Signal, 1024)
 	a.bus.Signal(signal)
 	defer a.bus.RemoveSignal(signal)
 
@@ -66,6 +71,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	if err := a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
 		return err
 	}
+
 	devices := make(map[dbus.ObjectPath]map[string]dbus.Variant)
 	for path, v := range deviceList {
 		device, ok := v["org.bluez.Device1"]
@@ -75,6 +81,9 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		if !strings.HasPrefix(string(path), string(a.adapter.Path())) {
 			continue // not part of our adapter
 		}
+
+		// localName, _ := device["Name"].Value().(string)
+		// fmt.Println("managed device", device["Address"].Value().(string), localName)
 
 		// try all devices, some may be out of range. could check RSSI?
 		// if not, then only a single client may resolve devices.
@@ -100,7 +109,12 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		return a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StopDiscovery", 0).Err
 	}
 
-	defer stop()
+	defer func() {
+		// ensure we cleanup after ourselves
+		_ = a.StopScan()
+
+		stop()
+	}()
 
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
@@ -121,11 +135,17 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 			case "org.freedesktop.DBus.ObjectManager.InterfacesAdded":
 				objectPath := sig.Body[0].(dbus.ObjectPath)
 				interfaces := sig.Body[1].(map[string]map[string]dbus.Variant)
+
 				rawprops, ok := interfaces["org.bluez.Device1"]
 				if !ok {
 					continue
 				}
+
 				devices[objectPath] = rawprops
+
+				// localName, _ := rawprops["Name"].Value().(string)
+				// fmt.Println("InterfacesAdded", rawprops["Address"].Value().(string), localName)
+
 				callback(a, makeScanResult(rawprops))
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
@@ -138,11 +158,27 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				if !ok {
 					// This shouldn't happen, but protect against it just in
 					// case.
+					// Could we try to get the device
 					continue
 				}
+
+				// do not report only rssi changes
+				if len(changes) == 1 {
+					if _, ok := changes["RSSI"]; ok {
+						continue
+					}
+				}
+
+				// var keys []string
+
 				for k, v := range changes {
 					device[k] = v
+					// keys = append(keys, k)
 				}
+
+				// localName, _ := device["Name"].Value().(string)
+				// fmt.Println("PropertiesChanged", device["Address"].Value().(string), localName, keys)
+
 				callback(a, makeScanResult(device))
 			}
 		}

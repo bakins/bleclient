@@ -25,7 +25,6 @@ type Adapter struct {
 type adapterOptions struct {
 	dbusAddress string
 	device      string
-	conn        *dbus.Conn
 }
 
 type AdapterOption interface {
@@ -50,17 +49,6 @@ func WithDbusAddress(address string) AdapterOption {
 	})
 }
 
-// WithDbusConn returns an AdapterOption which causes
-// the Adapter to use this dbus.Conn rather than creating one.
-// This connection should then be considered owned by
-// the adapter. The adapter will close the connection when
-// Apadter.Close is called.
-func WithDbusConn(conn *dbus.Conn) AdapterOption {
-	return adapterOptionFunc(func(o *adapterOptions) {
-		o.conn = conn
-	})
-}
-
 func NewAdapter(options ...AdapterOption) (*Adapter, error) {
 	opts := adapterOptions{
 		device: defaultAdapter,
@@ -71,15 +59,12 @@ func NewAdapter(options ...AdapterOption) (*Adapter, error) {
 	}
 
 	var err error
+	var bus *dbus.Conn
 
-	bus := opts.conn
-
-	if bus == nil {
-		if opts.dbusAddress == "" {
-			bus, err = dbus.ConnectSystemBus()
-		} else {
-			bus, err = dbus.Connect(opts.dbusAddress, dbus.WithAuth(dbus.AuthAnonymous()))
-		}
+	if opts.dbusAddress == "" {
+		bus, err = dbus.ConnectSystemBus()
+	} else {
+		bus, err = dbus.Connect(opts.dbusAddress, dbus.WithAuth(dbus.AuthAnonymous()))
 	}
 
 	if err != nil {
