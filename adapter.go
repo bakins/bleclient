@@ -6,6 +6,7 @@ package bleclient
 import (
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -13,6 +14,7 @@ import (
 const defaultAdapter = "hci0"
 
 type Adapter struct {
+	mu             sync.Mutex
 	id             string
 	scanCancelChan chan struct{}
 	bus            *dbus.Conn
