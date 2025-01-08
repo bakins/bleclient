@@ -3,6 +3,7 @@ package bleclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -39,23 +40,22 @@ func (s DeviceService) UUID() UUID {
 // On Linux with BlueZ, this just waits for the ServicesResolved signal (if
 // services haven't been resolved yet) and uses this list of cached services.
 func (d *Device) DiscoverServices(ctx context.Context, uuids []UUID) ([]*DeviceService, error) {
-	start := time.Now()
+	ticker := time.NewTicker(time.Millisecond * 100)
+	defer ticker.Stop()
 
+RESOLVED:
 	for {
-		// TODO: check context
-		resolved, err := d.device.GetProperty("org.bluez.Device1.ServicesResolved")
-		if err != nil {
-			return nil, err
-		}
-		if resolved.Value().(bool) {
-			break
-		}
-		// This is a terrible hack, but I couldn't find another way.
-		// TODO: actually there is, by waiting for a property change event of
-		// ServicesResolved.
-		time.Sleep(10 * time.Millisecond)
-		if time.Since(start) > 10*time.Second {
-			return nil, errors.New("timeout on DiscoverServices")
+		select {
+		case <-ticker.C:
+			resolved, err := d.device.GetProperty("org.bluez.Device1.ServicesResolved")
+			if err != nil {
+				return nil, err
+			}
+			if resolved.Value().(bool) {
+				break RESOLVED
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 
@@ -148,12 +148,12 @@ func (c DeviceCharacteristic) UUID() UUID {
 //
 // Passing a nil slice of UUIDs will return a complete
 // list of characteristics.
-func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUID) ([]DeviceCharacteristic, error) {
-	var chars []DeviceCharacteristic
+func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUID) ([]*DeviceCharacteristic, error) {
+	var chars []*DeviceCharacteristic
 	if len(uuids) > 0 {
 		// The caller wants to get a list of characteristics in a specific
 		// order.
-		chars = make([]DeviceCharacteristic, len(uuids))
+		chars = make([]*DeviceCharacteristic, len(uuids))
 	}
 
 	// Iterate through all objects managed by BlueZ, hoping to find the
@@ -177,7 +177,7 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 			continue
 		}
 		cuuid, _ := ParseUUID(properties["UUID"].Value().(string))
-		char := DeviceCharacteristic{
+		char := &DeviceCharacteristic{
 			uuidWrapper:    cuuid,
 			adapter:        s.adapter,
 			characteristic: s.adapter.bus.Object("org.bluez", dbus.ObjectPath(objectPath)),
@@ -187,7 +187,7 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 			// The caller wants to get a list of characteristics in a specific
 			// order. Check whether this is one of those.
 			for i, uuid := range uuids {
-				if chars[i] != (DeviceCharacteristic{}) {
+				if chars[i] != nil {
 					// To support multiple identical characteristics, we need to
 					// ignore the characteristics that are already found. See:
 					// https://github.com/tinygo-org/bluetooth/issues/131
@@ -207,7 +207,7 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 
 	// Check that we have found all characteristics.
 	for _, char := range chars {
-		if char == (DeviceCharacteristic{}) {
+		if char == nil {
 			return nil, errors.New("bluetooth: could not find some characteristics")
 		}
 	}
@@ -219,11 +219,18 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 // call will return before all data has been written. A limited number of such
 // writes can be in flight at any given time. This call is also known as a
 // "write command" (as opposed to a write request).
-func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byte) (n int, err error) {
-	err = c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
+func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byte) (int, error) {
+	// args := map[string]any{
+	// 	"type": "command",
+	// }
+
+	// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, args).Err
+	// if err != nil {
+	err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
 	if err != nil {
 		return 0, err
 	}
+
 	return len(p), nil
 }
 
@@ -242,6 +249,7 @@ func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback
 
 		// Start watching for changes in the Value property.
 		c.property = make(chan *dbus.Signal)
+
 		c.adapter.bus.Signal(c.property)
 		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
 
@@ -255,18 +263,31 @@ func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback
 		}
 
 		go func() {
-			for sig := range c.property {
-				if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-					interfaceName := sig.Body[0].(string)
-					if interfaceName != "org.bluez.GattCharacteristic1" {
-						continue
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case sig, ok := <-c.property:
+					if !ok {
+						return
 					}
-					if sig.Path != c.characteristic.Path() {
-						continue
-					}
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if value, ok := changes["Value"].Value().([]byte); ok {
-						callback(value)
+					if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
+						interfaceName := sig.Body[0].(string)
+
+						if interfaceName != "org.bluez.GattCharacteristic1" {
+							continue
+						}
+						if sig.Path != c.characteristic.Path() {
+							continue
+						}
+						changes := sig.Body[1].(map[string]dbus.Variant)
+
+						fmt.Println("org.freedesktop.DBus.Properties.PropertiesChanged", sig.Path, c.characteristic.Path(), interfaceName, changes)
+
+						if value, ok := changes["Value"].Value().([]byte); ok {
+							fmt.Println("calling notification callback", c.characteristic.Path())
+							callback(value)
+						}
 					}
 				}
 			}
@@ -275,13 +296,21 @@ func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback
 		return nil
 
 	case nil:
+		// need a lock around this?
 		if c.property == nil {
 			return nil
 		}
 
+		// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
+		// if err != nil {
+		//		fmt.Println("org.bluez.GattCharacteristic1.StopNotify", err)
+		//	}
+
 		err := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
 		c.adapter.bus.RemoveSignal(c.property)
+		close(c.property)
 		c.property = nil
+
 		return err
 	}
 }
