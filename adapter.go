@@ -14,14 +14,17 @@ import (
 const defaultAdapter = "hci0"
 
 type Adapter struct {
-	mu             sync.Mutex
-	id             string
-	scanCancelChan chan struct{}
+	mu sync.Mutex
+	id string
+	// scanCancelChan chan struct{}
 	bus            *dbus.Conn
 	bluez          dbus.BusObject // object at /
 	adapter        dbus.BusObject // object at /org/bluez/hciX
 	address        string
 	connectHandler func(device Device, connected bool)
+
+	// we can only have one scan at a time and connect does not work when scanning
+	scanning bool
 }
 
 type adapterOptions struct {

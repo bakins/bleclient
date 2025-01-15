@@ -3,7 +3,6 @@ package bleclient
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -128,10 +127,8 @@ RESOLVED:
 // device.
 type DeviceCharacteristic struct {
 	uuidWrapper
-	adapter                      *Adapter
-	characteristic               dbus.BusObject
-	property                     chan *dbus.Signal // channel where notifications are reported
-	propertiesChangedMatchOption dbus.MatchOption  // the same value must be passed to RemoveMatchSignal
+	adapter        *Adapter
+	characteristic dbus.BusObject
 }
 
 // UUID returns the UUID for this DeviceCharacteristic.
@@ -220,12 +217,6 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 // writes can be in flight at any given time. This call is also known as a
 // "write command" (as opposed to a write request).
 func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byte) (int, error) {
-	// args := map[string]any{
-	// 	"type": "command",
-	// }
-
-	// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, args).Err
-	// if err != nil {
 	err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
 	if err != nil {
 		return 0, err
@@ -240,78 +231,133 @@ func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byt
 // changes.
 //
 // Users may call EnableNotifications with a nil callback to disable notifications.
-func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback func(buf []byte)) error {
-	switch callback {
-	default:
-		if c.property != nil {
-			return errDupNotif
-		}
+// func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback func(buf []byte)) error {
+// 	switch callback {
+// 	default:
+// 		if c.property != nil {
+// 			return errDupNotif
+// 		}
 
-		// Start watching for changes in the Value property.
-		c.property = make(chan *dbus.Signal)
+// 		// Start watching for changes in the Value property.
+// 		c.property = make(chan *dbus.Signal)
 
-		c.adapter.bus.Signal(c.property)
-		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
+// 		c.adapter.bus.Signal(c.property)
+// 		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
 
-		if err := c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption); err != nil {
-			return err
-		}
+// 		if err := c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption); err != nil {
+// 			return err
+// 		}
 
-		err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
-		if err != nil {
-			return err
-		}
+// 		err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
+// 		if err != nil {
+// 			return err
+// 		}
 
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case sig, ok := <-c.property:
-					if !ok {
-						return
-					}
-					if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-						interfaceName := sig.Body[0].(string)
+// 		go func() {
+// 			for {
+// 				select {
+// 				case <-ctx.Done():
+// 					return
+// 				case sig, ok := <-c.property:
+// 					if !ok {
+// 						return
+// 					}
+// 					if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
+// 						interfaceName := sig.Body[0].(string)
 
-						if interfaceName != "org.bluez.GattCharacteristic1" {
-							continue
-						}
-						if sig.Path != c.characteristic.Path() {
-							continue
-						}
-						changes := sig.Body[1].(map[string]dbus.Variant)
+// 						if interfaceName != "org.bluez.GattCharacteristic1" {
+// 							continue
+// 						}
+// 						if sig.Path != c.characteristic.Path() {
+// 							continue
+// 						}
+// 						changes := sig.Body[1].(map[string]dbus.Variant)
 
-						fmt.Println("org.freedesktop.DBus.Properties.PropertiesChanged", sig.Path, c.characteristic.Path(), interfaceName, changes)
+// 						if value, ok := changes["Value"].Value().([]byte); ok {
+// 							callback(value)
+// 						}
+// 					}
+// 				}
+// 			}
+// 		}()
 
-						if value, ok := changes["Value"].Value().([]byte); ok {
-							fmt.Println("calling notification callback", c.characteristic.Path())
-							callback(value)
-						}
-					}
-				}
-			}
-		}()
+// 		return nil
 
-		return nil
+// 	case nil:
+// 		// need a lock around this?
+// 		if c.property == nil {
+// 			return nil
+// 		}
 
-	case nil:
-		// need a lock around this?
-		if c.property == nil {
-			return nil
-		}
+// 		// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
+// 		// if err != nil {
+// 		//		fmt.Println("org.bluez.GattCharacteristic1.StopNotify", err)
+// 		//	}
 
-		// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
-		// if err != nil {
-		//		fmt.Println("org.bluez.GattCharacteristic1.StopNotify", err)
-		//	}
+// 		err := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
+// 		c.adapter.bus.RemoveSignal(c.property)
+// 		close(c.property)
+// 		c.property = nil
 
-		err := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
-		c.adapter.bus.RemoveSignal(c.property)
-		close(c.property)
-		c.property = nil
+// 		return err
+// 	}
+// }
 
+func (c *DeviceCharacteristic) HandleNotifications(ctx context.Context, callback func(buf []byte)) error {
+	property := make(chan *dbus.Signal)
+	defer close(property)
+
+	c.adapter.bus.Signal(property)
+	defer c.adapter.bus.RemoveSignal(property)
+
+	propertiesChangedMatchOption := dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
+
+	if err := c.adapter.bus.AddMatchSignal(propertiesChangedMatchOption); err != nil {
 		return err
+	}
+
+	defer func() {
+		_ = c.adapter.bus.RemoveMatchSignal(propertiesChangedMatchOption)
+	}()
+
+	err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		_ = c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case sig, ok := <-property:
+			if !ok {
+				return nil
+			}
+			if sig.Name != "org.freedesktop.DBus.Properties.PropertiesChanged" {
+				continue
+			}
+
+			interfaceName := sig.Body[0].(string)
+
+			if interfaceName != "org.bluez.GattCharacteristic1" {
+				continue
+			}
+
+			if sig.Path != c.characteristic.Path() {
+				continue
+			}
+			changes := sig.Body[1].(map[string]dbus.Variant)
+
+			if value, ok := changes["Value"].Value().([]byte); ok {
+				callback(value)
+			}
+		}
 	}
 }
 

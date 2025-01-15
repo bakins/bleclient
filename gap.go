@@ -5,11 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"golang.org/x/sync/errgroup"
 )
 
 // Address contains a Bluetooth MAC address.
@@ -19,17 +17,34 @@ type Address struct {
 
 func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult)) error {
 	a.mu.Lock()
-	if a.scanCancelChan != nil {
+	if a.scanning {
 		a.mu.Unlock()
 		return errScanning
 	}
 
+	a.scanning = true
+	a.mu.Unlock()
+
+	defer func() {
+		a.mu.Lock()
+		a.scanning = false
+		a.mu.Unlock()
+	}()
+
+	//if a.scanCancelChan != nil {
+	//	a.mu.Unlock()
+	//	return errScanning
+	//}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	// Channel that will be closed when the scan is stopped.
 	// Detecting whether the scan is stopped can be done by doing a non-blocking
 	// read from it. If it succeeds, the scan is stopped.
-	cancelChan := make(chan struct{})
-	a.scanCancelChan = cancelChan
-	a.mu.Unlock()
+	// cancelChan := make(chan struct{})
+	// a.scanCancelChan = cancelChan
+	// a.mu.Unlock()
 
 	var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
 	if err := a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
@@ -51,9 +66,9 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 
 		// try all devices, some may be out of range. could check RSSI?
 		// if not, then only a single client may resolve devices.
-		callback(a, makeScanResult(device))
+		callback(a, makeScanResult(ctx, cancel, device))
 		select {
-		case <-cancelChan:
+		case <-ctx.Done():
 			return nil
 		default:
 		}
@@ -127,8 +142,8 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 
 	defer func() {
 		// ensure we cleanup after ourselves
-		_ = a.StopScan()
-		stop()
+		//_ = a.StopScan()
+		_ = stop()
 	}()
 
 	for {
@@ -140,8 +155,8 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case <-cancelChan:
-			return nil
+		// case <-cancelChan:
+		//	return nil
 
 		case sig, ok := <-signal:
 			if !ok {
@@ -164,7 +179,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				// localName, _ := rawprops["Name"].Value().(string)
 				// fmt.Println("InterfacesAdded", rawprops["Address"].Value().(string), localName)
 
-				callback(a, makeScanResult(rawprops))
+				callback(a, makeScanResult(ctx, cancel, rawprops))
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
 
@@ -197,7 +212,7 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 				// localName, _ := device["Name"].Value().(string)
 				// fmt.Println("PropertiesChanged", device["Address"].Value().(string), localName, keys)
 
-				callback(a, makeScanResult(device))
+				callback(a, makeScanResult(ctx, cancel, device))
 			}
 		}
 	}
@@ -207,30 +222,31 @@ func (a *Adapter) IsScanning() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return a.scanCancelChan != nil
+	return a.scanning
+	// return a.scanCancelChan != nil
 }
 
 // StopScan stops any in-progress scan. It can be called from within a Scan
 // callback to stop the current scan. If no scan is in progress, an error will
 // be returned.
-func (a *Adapter) StopScan() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// func (a *Adapter) xStopScan() error {
+// 	a.mu.Lock()
+// 	defer a.mu.Unlock()
 
-	if a.scanCancelChan == nil {
-		return errNotScanning
-	}
-	select {
-	case <-a.scanCancelChan:
-		close(a.scanCancelChan)
-	default:
-	}
-	a.scanCancelChan = nil
-	return nil
-}
+// 	if a.scanCancelChan == nil {
+// 		return errNotScanning
+// 	}
+// 	select {
+// 	case <-a.scanCancelChan:
+// 		close(a.scanCancelChan)
+// 	default:
+// 	}
+// 	a.scanCancelChan = nil
+// 	return nil
+// }
 
 // makeScanResult creates a ScanResult from a raw DBus device.
-func makeScanResult(props map[string]dbus.Variant) ScanResult {
+func makeScanResult(ctx context.Context, cancel context.CancelFunc, props map[string]dbus.Variant) ScanResult {
 	// Assume the Address property is well-formed.
 	addr, _ := ParseMAC(props["Address"].Value().(string))
 
@@ -284,6 +300,8 @@ func makeScanResult(props map[string]dbus.Variant) ScanResult {
 				ServiceData:      serviceData,
 			},
 		},
+		ctx:  ctx,
+		stop: cancel,
 	}
 }
 
@@ -380,84 +398,84 @@ CONNECT:
 }
 
 // ConnectDevice will do a discovery if needed
-func (a *Adapter) ConnectDevice(ctx context.Context, address Address) (*Device, error) {
-	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.Replace(address.MAC.String(), ":", "_", -1))
-	obj := a.bus.Object("org.bluez", devicePath)
-	_, err := obj.GetProperty("org.bluez.Device1.Connected")
-	if err == nil {
-		// device exists - not their is a small chance of a race here
-		return a.Connect(ctx, address)
-	}
+// func (a *Adapter) ConnectDevice(ctx context.Context, address Address) (*Device, error) {
+// 	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.Replace(address.MAC.String(), ":", "_", -1))
+// 	obj := a.bus.Object("org.bluez", devicePath)
+// 	_, err := obj.GetProperty("org.bluez.Device1.Connected")
+// 	if err == nil {
+// 		// device exists - not their is a small chance of a race here
+// 		return a.Connect(ctx, address)
+// 	}
 
-	if err := discoverDevice(ctx, a, address); err != nil {
-		return nil, err
-	}
+// 	if err := discoverDevice(ctx, a, address); err != nil {
+// 		return nil, err
+// 	}
 
-	return a.Connect(ctx, address)
-}
+// 	return a.Connect(ctx, address)
+// }
 
-func discoverDevice(ctx context.Context, adapter *Adapter, address Address) error {
-	found := false
-	err := bluetoothScan(ctx, adapter, func(ctx context.Context, result ScanResult) bool {
-		found = result.Address.String() == address.String()
+// func discoverDevice(ctx context.Context, adapter *Adapter, address Address) error {
+// 	found := false
+// 	err := bluetoothScan(ctx, adapter, func(ctx context.Context, result ScanResult) bool {
+// 		found = result.Address.String() == address.String()
 
-		return !found
-	})
-	if err != nil {
-		return err
-	}
-	if !found {
-		return fmt.Errorf("did not discover device")
-	}
+// 		return !found
+// 	})
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if !found {
+// 		return fmt.Errorf("did not discover device")
+// 	}
 
-	return nil
-}
+// 	return nil
+// }
 
-func bluetoothScan(
-	ctx context.Context,
-	adapter *Adapter,
-	callback func(ctx context.Context, result ScanResult) bool,
-) error {
-	running := &atomic.Bool{}
-	running.Store(true)
+// func bluetoothScan(
+// 	ctx context.Context,
+// 	adapter *Adapter,
+// 	callback func(ctx context.Context, result ScanResult) bool,
+// ) error {
+// 	running := &atomic.Bool{}
+// 	running.Store(true)
 
-	// so the go routing waiting on context can finish
-	done := make(chan struct{})
+// 	// so the go routing waiting on context can finish
+// 	done := make(chan struct{})
 
-	stopScan := func() {
-		if running.CompareAndSwap(true, false) {
-			// only returns an error if not scanning
-			// must only call once
-			_ = adapter.StopScan()
-			close(done)
-		}
-	}
+// 	stopScan := func() {
+// 		if running.CompareAndSwap(true, false) {
+// 			// only returns an error if not scanning
+// 			// must only call once
+// 			_ = adapter.StopScan()
+// 			close(done)
+// 		}
+// 	}
 
-	eg, ctx := errgroup.WithContext(ctx)
+// 	eg, ctx := errgroup.WithContext(ctx)
 
-	eg.Go(func() error {
-		select {
-		case <-ctx.Done():
-			stopScan()
-		case <-done:
-			stopScan()
-		}
+// 	eg.Go(func() error {
+// 		select {
+// 		case <-ctx.Done():
+// 			stopScan()
+// 		case <-done:
+// 			stopScan()
+// 		}
 
-		return nil
-	})
+// 		return nil
+// 	})
 
-	eg.Go(func() error {
-		return adapter.Scan(
-			ctx,
-			func(adapter *Adapter, result ScanResult) {
-				if !callback(ctx, result) {
-					stopScan()
-				}
-			})
-	})
+// 	eg.Go(func() error {
+// 		return adapter.Scan(
+// 			ctx,
+// 			func(adapter *Adapter, result ScanResult) {
+// 				if !callback(ctx, result) {
+// 					stopScan()
+// 				}
+// 			})
+// 	})
 
-	return eg.Wait()
-}
+// 	return eg.Wait()
+// }
 
 func (a *Adapter) NewDevice(address Address) *Device {
 	devicePath := dbus.ObjectPath(string(a.adapter.Path()) + "/dev_" + strings.Replace(address.MAC.String(), ":", "_", -1))
@@ -646,6 +664,14 @@ type ScanResult struct {
 	// you need any of the fields to stay alive until after the callback
 	// returns, copy them.
 	AdvertisementPayload
+
+	ctx  context.Context
+	stop context.CancelFunc
+}
+
+func (s ScanResult) Stop() {
+	s.stop()
+	<-s.ctx.Done()
 }
 
 // AdvertisementPayload contains information obtained during a scan (see
