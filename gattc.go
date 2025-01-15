@@ -223,85 +223,8 @@ func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byt
 	return len(p), nil
 }
 
-// EnableNotifications enables notifications in the Client Characteristic
-// Configuration Descriptor (CCCD). This means that most peripherals will send a
-// notification with a new value every time the value of the characteristic
-// changes.
-//
-// Users may call EnableNotifications with a nil callback to disable notifications.
-// func (c *DeviceCharacteristic) EnableNotifications(ctx context.Context, callback func(buf []byte)) error {
-// 	switch callback {
-// 	default:
-// 		if c.property != nil {
-// 			return errDupNotif
-// 		}
-
-// 		// Start watching for changes in the Value property.
-// 		c.property = make(chan *dbus.Signal)
-
-// 		c.adapter.bus.Signal(c.property)
-// 		c.propertiesChangedMatchOption = dbus.WithMatchInterface("org.freedesktop.DBus.Properties")
-
-// 		if err := c.adapter.bus.AddMatchSignal(c.propertiesChangedMatchOption); err != nil {
-// 			return err
-// 		}
-
-// 		err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StartNotify", 0).Err
-// 		if err != nil {
-// 			return err
-// 		}
-
-// 		go func() {
-// 			for {
-// 				select {
-// 				case <-ctx.Done():
-// 					return
-// 				case sig, ok := <-c.property:
-// 					if !ok {
-// 						return
-// 					}
-// 					if sig.Name == "org.freedesktop.DBus.Properties.PropertiesChanged" {
-// 						interfaceName := sig.Body[0].(string)
-
-// 						if interfaceName != "org.bluez.GattCharacteristic1" {
-// 							continue
-// 						}
-// 						if sig.Path != c.characteristic.Path() {
-// 							continue
-// 						}
-// 						changes := sig.Body[1].(map[string]dbus.Variant)
-
-// 						if value, ok := changes["Value"].Value().([]byte); ok {
-// 							callback(value)
-// 						}
-// 					}
-// 				}
-// 			}
-// 		}()
-
-// 		return nil
-
-// 	case nil:
-// 		// need a lock around this?
-// 		if c.property == nil {
-// 			return nil
-// 		}
-
-// 		// err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.StopNotify", 0).Err
-// 		// if err != nil {
-// 		//		fmt.Println("org.bluez.GattCharacteristic1.StopNotify", err)
-// 		//	}
-
-// 		err := c.adapter.bus.RemoveMatchSignal(c.propertiesChangedMatchOption)
-// 		c.adapter.bus.RemoveSignal(c.property)
-// 		close(c.property)
-// 		c.property = nil
-
-// 		return err
-// 	}
-// }
-
 func (c *DeviceCharacteristic) HandleNotifications(ctx context.Context, callback func(buf []byte)) error {
+	// needs to be buffered?
 	property := make(chan *dbus.Signal)
 	defer close(property)
 
