@@ -552,10 +552,7 @@ func (d *Device) Disconnect() error {
 	}
 }
 
-var (
-	errScanning    = errors.New("bluetooth: a scan is already in progress")
-	errNotScanning = errors.New("bluetooth: there is no scan in progress")
-)
+var errScanning = errors.New("bluetooth: a scan is already in progress")
 
 // MACAddress contains a Bluetooth address which is a MAC address.
 type MACAddress struct {

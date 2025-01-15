@@ -10,8 +10,6 @@ import (
 	"github.com/godbus/dbus/v5"
 )
 
-var errDupNotif = errors.New("unclosed notifications")
-
 // UUIDWrapper is a type alias for UUID so we ensure no conflicts with
 // struct method of the same name.
 type uuidWrapper = UUID
