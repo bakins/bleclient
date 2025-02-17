@@ -34,30 +34,6 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
-	if err := a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
-		return err
-	}
-
-	devices := make(map[dbus.ObjectPath]map[string]dbus.Variant)
-	for path, v := range deviceList {
-		device, ok := v["org.bluez.Device1"]
-		if !ok {
-			continue // not a device
-		}
-		if !strings.HasPrefix(string(path), string(a.adapter.Path())) {
-			continue // not part of our adapter
-		}
-
-		callback(a, makeScanResult(ctx, cancel, device))
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		devices[path] = device
-	}
-
 	// This appears to be necessary to receive any BLE discovery results at all.
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
@@ -122,6 +98,34 @@ func (a *Adapter) Scan(ctx context.Context, callback func(*Adapter, ScanResult))
 
 		_ = a.adapter.CallWithContext(ctx, "org.bluez.Adapter1.StopDiscovery", 0).Err
 	}()
+
+	var deviceList map[dbus.ObjectPath]map[string]map[string]dbus.Variant
+	if err := a.bluez.CallWithContext(ctx, "org.freedesktop.DBus.ObjectManager.GetManagedObjects", 0).Store(&deviceList); err != nil {
+		return err
+	}
+
+	devices := make(map[dbus.ObjectPath]map[string]dbus.Variant)
+	for path, v := range deviceList {
+		device, ok := v["org.bluez.Device1"]
+		if !ok {
+			continue // not a device
+		}
+		if !strings.HasPrefix(string(path), string(a.adapter.Path())) {
+			continue // not part of our adapter
+		}
+
+		/*
+			if device["Connected"].Value().(bool) {
+				callback(a, makeScanResult(ctx, cancel, device))
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+				}
+			}
+		*/
+		devices[path] = device
+	}
 
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
@@ -276,13 +280,18 @@ func (d *Device) Connect(ctx context.Context) error {
 	// Already start watching for property changes. We do this before reading
 	// the Connected property below to avoid a race condition: if the device
 	// were connected between the two calls the signal wouldn't be picked up.
-	signal := make(chan *dbus.Signal)
+	signal := make(chan *dbus.Signal, 4)
 	defer close(signal)
 
 	d.adapter.bus.Signal(signal)
 	defer d.adapter.bus.RemoveSignal(signal)
 
-	propertiesChangedMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties")}
+	propertiesChangedMatchOptions := []dbus.MatchOption{
+		dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
+		dbus.WithMatchObjectPath(d.device.Path()),
+		dbus.WithMatchArg(0, "org.bluez.Device1"),
+		dbus.WithMatchMember("PropertiesChanged"),
+	}
 	if err := d.adapter.bus.AddMatchSignalContext(ctx, propertiesChangedMatchOptions...); err != nil {
 		return err
 	}
@@ -317,7 +326,7 @@ func (d *Device) Connect(ctx context.Context) error {
 		}
 	}
 
-CONNECT:
+	// CONNECT:
 	for {
 		select {
 		case <-ctx.Done():
@@ -326,20 +335,23 @@ CONNECT:
 			if !ok {
 				return errors.New("did not receive connected signal")
 			}
-			switch sig.Name {
-			case "org.freedesktop.DBus.Properties.PropertiesChanged":
-				interfaceName := sig.Body[0].(string)
-				if interfaceName != "org.bluez.Device1" {
-					continue CONNECT
-				}
-				if sig.Path != d.device.Path() {
-					continue CONNECT
-				}
-				changes := sig.Body[1].(map[string]dbus.Variant)
-				if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-					return nil
-				}
+			//switch sig.Name {
+			//case "org.freedesktop.DBus.Properties.PropertiesChanged":
+			// interfaceName := sig.Body[0].(string)
+			// if interfaceName != "org.bluez.Device1" {
+			// 	continue CONNECT
+			// }
+			//if sig.Path != d.device.Path() {
+			//	continue CONNECT
+			//}
+
+			// fmt.Println(d.device.Path(), sig.Path, sig.Body[0])
+
+			changes := sig.Body[1].(map[string]dbus.Variant)
+			if connected, ok := changes["Connected"].Value().(bool); ok && connected {
+				return nil
 			}
+			//}
 		}
 	}
 }

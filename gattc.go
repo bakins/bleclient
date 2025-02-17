@@ -215,7 +215,15 @@ func (s *DeviceService) DiscoverCharacteristics(ctx context.Context, uuids []UUI
 // writes can be in flight at any given time. This call is also known as a
 // "write command" (as opposed to a write request).
 func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byte) (int, error) {
-	err := c.characteristic.CallWithContext(ctx, "org.bluez.GattCharacteristic1.WriteValue", 0, p, map[string]dbus.Variant(nil)).Err
+	err := c.characteristic.CallWithContext(
+		ctx,
+		"org.bluez.GattCharacteristic1.WriteValue",
+		0,
+		p,
+		map[string]dbus.Variant{
+			"type": dbus.MakeVariant("command"),
+		},
+	).Err
 	if err != nil {
 		return 0, err
 	}
@@ -225,7 +233,7 @@ func (c *DeviceCharacteristic) WriteWithoutResponse(ctx context.Context, p []byt
 
 func (c *DeviceCharacteristic) HandleNotifications(ctx context.Context, callback func(buf []byte)) error {
 	// needs to be buffered?
-	property := make(chan *dbus.Signal)
+	property := make(chan *dbus.Signal, 4)
 	defer close(property)
 
 	c.adapter.bus.Signal(property)
